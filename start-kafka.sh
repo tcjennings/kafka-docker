@@ -1,28 +1,55 @@
 #!/bin/bash
 
 if [[ -z "$KAFKA_PORT" ]]; then
+    echo "[CONFIG] Setting default Kafka Port=9092"    
     export KAFKA_PORT=9092
 fi
 
+# If the config includes listeners, save them for later:
+if [[ -n "$KAFKA_LISTENERS" && -n "$KAFKA_ADVERTISED_LISTENERS" && -n "$KAFKA_LISTENER_SECURITY_PROTOCOL_MAP" && -n "$KAFKA_INTER_BROKER_LISTENER_NAME" ]]; then
+ echo "[CONFIG] Detected manual listener configuration."
+ export CANDIDATE_KAFKA_LISTENERS="$KAFKA_LISTENERS"
+ export CANDIDATE_KAFKA_ADVERTISED_LISTENERS="$KAFKA_ADVERTISED_LISTENERS"
+ export CANDIDATE_KAFKA_INTER_BROKER_LISTENER_NAME="$KAFKA_INTER_BROKER_LISTENER_NAME"
+ #export CANDIDATE_KAFKA_LISTENER_SECURITY_PROTOCOL_MAP="$KAFKA_LISTENER_SECURITY_PROTOCOL_MAP"
+
+ # prevent some unnecessary execution based on otherwise unused configuration
+ unset KAFKA_PORT
+ unset KAFKA_ADVERTISED_PORT
+ unset KAFKA_ADVERTISED_PROTOCOL_NAME
+ unset KAFKA_PROTOCOL_NAME
+fi
+
 create-topics.sh &
+
+if [[ -n "$KAFKA_ADVERTISED_PORT" && -S /var/run/docker.sock ]]; then
+  export DOCKER_BOUND_PORT=$(docker port `hostname` $KAFKA_ADVERTISED_PORT | sed -r "s/.*:(.*)/\1/g")
+  echo "[CONFIG] Detected host bound port $DOCKER_BOUND_PORT for Kafka advertised port $KAFKA_ADVERTISED_PORT"
+fi
 
 if [[ -z "$KAFKA_ADVERTISED_PORT" && \
   -z "$KAFKA_LISTENERS" && \
   -z "$KAFKA_ADVERTISED_LISTENERS" && \
   -S /var/run/docker.sock ]]; then
     export KAFKA_ADVERTISED_PORT=$(docker port `hostname` $KAFKA_PORT | sed -r "s/.*:(.*)/\1/g")
+    echo "[CONFIG] Detected advertised port $KAFKA_ADVERTISED_PORT on Docker host."
 fi
+
 if [[ -z "$KAFKA_BROKER_ID" ]]; then
     if [[ -n "$BROKER_ID_COMMAND" ]]; then
+        echo "[CONFIG] Evaluating Broker ID command."
         export KAFKA_BROKER_ID=$(eval $BROKER_ID_COMMAND)
     else
         # By default auto allocate broker ID
+        echo "[CONFIG] Using Broker ID default auto allocation."
         export KAFKA_BROKER_ID=-1
     fi
 fi
 if [[ -z "$KAFKA_LOG_DIRS" ]]; then
+    echo "[CONFIG] Setting Log Dir."
     export KAFKA_LOG_DIRS="/kafka/kafka-logs-$HOSTNAME"
 fi
+
 if [[ -z "$KAFKA_ZOOKEEPER_CONNECT" ]]; then
     export KAFKA_ZOOKEEPER_CONNECT=$(env | grep ZK.*PORT_2181_TCP= | sed -e 's|.*tcp://||' | paste -sd ,)
 fi
@@ -33,33 +60,48 @@ if [[ -n "$KAFKA_HEAP_OPTS" ]]; then
 fi
 
 if [[ -z "$KAFKA_ADVERTISED_HOST_NAME" && -n "$HOSTNAME_COMMAND" ]]; then
+    echo "[CONFIG] Evaluation Advertised Host Name command."
     export KAFKA_ADVERTISED_HOST_NAME=$(eval $HOSTNAME_COMMAND)
 fi
 
 if [[ -n "$KAFKA_LISTENER_SECURITY_PROTOCOL_MAP" ]]; then
   if [[ -n "$KAFKA_ADVERTISED_PORT" && -n "$KAFKA_ADVERTISED_PROTOCOL_NAME" ]]; then
-    export KAFKA_ADVERTISED_LISTENERS="${KAFKA_ADVERTISED_PROTOCOL_NAME}://${KAFKA_ADVERTISED_HOST_NAME-}:${KAFKA_ADVERTISED_PORT}"
+    echo "[CONFIG] Configuring Advertised Listeners."
+    export KAFKA_ADVERTISED_LISTENERS="${KAFKA_ADVERTISED_PROTOCOL_NAME}://${KAFKA_ADVERTISED_HOST_NAME-}:${DOCKER_BOUND_PORT-${KAFKA_ADVERTISED_PORT}}"
     export KAFKA_LISTENERS="$KAFKA_ADVERTISED_PROTOCOL_NAME://:$KAFKA_ADVERTISED_PORT"
   fi
 
-  if [[ -z "$KAFKA_PROTOCOL_NAME" ]]; then
+  if [[ -z "$KAFKA_PROTOCOL_NAME" && -z "$KAFKA_LISTENERS" ]]; then
+    echo "[CONFIG] Setting Kafka Protocol Name in absence of Kafka Listener."
     export KAFKA_PROTOCOL_NAME="${KAFKA_ADVERTISED_PROTOCOL_NAME}"
   fi
 
   if [[ -n "$KAFKA_PORT" && -n "$KAFKA_PROTOCOL_NAME" ]]; then
+    echo "[CONFIG] Setting additional listener for $KAFKA_PROTOCOL_NAME on $KAFKA_PORT."
     export ADD_LISTENER="${KAFKA_PROTOCOL_NAME}://${KAFKA_HOST_NAME-}:${KAFKA_PORT}"
   fi
 
   if [[ -z "$KAFKA_INTER_BROKER_LISTENER_NAME" ]]; then
+    echo "[CONFIG] Defaulting inter-broker listener to $KAFKA_PROTOCOL_NAME."
     export KAFKA_INTER_BROKER_LISTENER_NAME=$KAFKA_PROTOCOL_NAME
   fi
 
   #Bootstrap SSL
   if [[ "${KAFKA_LISTENER_SECURITY_PROTOCOL_MAP}" =~ "SSL" ]]; then
+    echo "[CONFIG] Bootstrapping SSL."
     source /usr/bin/ssl-bootstrap.sh
-  fi    
+  fi 
+
+  #Use the Candidate configuration if it exists
+  export KAFKA_LISTENERS=${CANDIDATE_KAFKA_LISTENERS-${KAFKA_LISTENERS}}
+  export KAFKA_ADVERTISED_LISTENERS=${CANDIDATE_KAFKA_ADVERTISED_LISTENERS-${KAFKA_ADVERTISED_LISTENERS}}
+  export KAFKA_INTER_BROKER_LISTENER_NAME=${CANDIDATE_KAFKA_BROKER_LISTENER_NAME-${KAFKA_INTER_BROKER_LISTENER_NAME}}
+  unset CANDIDATE_KAFKA_LISTENERS
+  unset CANDIDATE_KAFKA_ADVERTISED_LISTENERS
+  unset CANDIDATE_KAFKA_BROKER_LISTENER_NAME
 else
    #DEFAULT LISTENERS 
+   echo "[CONFIG] Configuring default listeners."
    export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${KAFKA_ADVERTISED_HOST_NAME-}:${KAFKA_ADVERTISED_PORT-$KAFKA_PORT}"
    export KAFKA_LISTENERS="PLAINTEXT://${KAFKA_HOST_NAME-}:${KAFKA_PORT-9092}"
 fi
@@ -80,9 +122,13 @@ if [[ -n "$ADD_LISTENER" && -z "$KAFKA_ADVERTISED_LISTENERS" ]]; then
   export KAFKA_ADVERTISED_LISTENERS="${ADD_LISTENER}"
 fi
 
-if [[ -n "$KAFKA_INTER_BROKER_LISTENER_NAME" && ! "$KAFKA_INTER_BROKER_LISTENER_NAME"X = "$KAFKA_PROTOCOL_NAME"X ]]; then
-   if [[ -n "$KAFKA_INTER_BROKER_PORT" ]]; then
+#Configure a inter broker listener if a name is provided that does not match the kafka protocol name
+# - use kafka_port + 1 if a port is not specified.
+if [[ -n "$KAFKA_INTER_BROKER_LISTENER_NAME" && -n "$KAFKA_PROTOCOL_NAME" && ! "$KAFKA_INTER_BROKER_LISTENER_NAME"X = "$KAFKA_PROTOCOL_NAME"X ]]; then
+   echo "[CONFIG] Configuring Inter Broker Listener."
+   if [[ -z "$KAFKA_INTER_BROKER_PORT" ]]; then
       export KAFKA_INTER_BROKER_PORT=$(( $KAFKA_PORT + 1 ))
+      echo "[CONFIG] ... Using default port $KAFKA_INTER_BROKER_PORT."
    fi
    export INTER_BROKER_LISTENER="${KAFKA_INTER_BROKER_LISTENER_NAME}://:${KAFKA_INTER_BROKER_PORT}"
    export KAFKA_LISTENERS="${KAFKA_LISTENERS},${INTER_BROKER_LISTENER}"
@@ -93,6 +139,7 @@ if [[ -n "$KAFKA_INTER_BROKER_LISTENER_NAME" && ! "$KAFKA_INTER_BROKER_LISTENER_
 fi
 
 if [[ -n "$RACK_COMMAND" && -z "$KAFKA_BROKER_RACK" ]]; then
+    echo "[CONFIG] Evaluating Broker Rack command."
     export KAFKA_BROKER_RACK=$(eval $RACK_COMMAND)
 fi
 
@@ -106,6 +153,7 @@ unset KAFKA_PROTOCOL_NAME
 if [[ -n "$KAFKA_ADVERTISED_LISTENERS" ]]; then
   unset KAFKA_ADVERTISED_PORT
   unset KAFKA_ADVERTISED_HOST_NAME
+  unset DOCKER_BOUND_PORT
 fi
 
 if [[ -n "$KAFKA_LISTENERS" ]]; then
@@ -137,6 +185,7 @@ do
 done
 
 if [[ -n "$CUSTOM_INIT_SCRIPT" ]] ; then
+  echo "[CONFIG] Evaluation custom init script."
   eval $CUSTOM_INIT_SCRIPT
 fi
 
